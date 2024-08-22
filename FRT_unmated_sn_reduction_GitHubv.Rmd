@@ -1,0 +1,515 @@
+---
+title: "FRT_unmated_sn_reduction part I_final_SoupX"
+author: "Rachel Thayer"
+date: "3/29/2022 and Feb 7 2023"
+output:
+    html_document:
+      keep_md: TRUE
+---
+Load packages
+```{r, warning=FALSE,error=FALSE,message=FALSE}
+library(SoupX)
+library(Seurat)
+library(sctransform)
+library(patchwork)
+library(limma)
+library(ggplot2)
+library(Matrix)
+library(dplyr)
+library(DoubletFinder)
+library(RCurl)
+library(clustree)
+library(tidyr)
+library(kableExtra)
+library(htmltools)
+```
+
+## About the experiment
+
+These data are 150bp Novaseq PE reads. Libraries were generated with 10X Genomics Chromium, prepared at UC Davis genomics core in December 2021. These are nuclei from whole lower female reproductive tracts, from unmated Drosophila melanogaster. One run is flies from Fairfield, ME (15 semi inbred genotypes pooled together; 75 total flies). The second run is flies from Panama (same # of genotypes and flies). The data have been preprocessed by cellranger.
+
+```{r exp_setup, warning=FALSE,error=FALSE, message=FALSE}
+
+experiment_name = "Dmel Unmated FRT"
+dataset_loc <- "/data/rthayer/FRT_unmated_nuclei/cellranger_files"
+ids <- c("ME-wdenovo2", "PAN-wdenovo2") 
+setwd("/data/rthayer/FRT_unmated_nuclei")
+```
+
+## Overview of data
+# Cellranger results:
+
+```{r read metrics}
+d10x.metrics <- lapply(ids, function(i){
+  metrics <- read.csv(file.path(dataset_loc,paste0(i,"/outs"),"metrics_summary.csv"), colClasses = "character")
+})
+experiment.metrics <- do.call("rbind", d10x.metrics)
+rownames(experiment.metrics) <- ids
+
+sequencing.metrics <- data.frame(t(experiment.metrics[,c(1:19)]))
+
+row.names(sequencing.metrics) <- gsub("\\."," ", rownames(sequencing.metrics))
+
+sequencing.metrics %>%
+  kable(caption = 'Cell Ranger Results') %>%
+  pack_rows("Overview", 1, 3, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Sequencing Characteristics", 4, 9, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Mapping Characteristics", 10, 19, label_row_css = "background-color: #666; color: #fff;") %>%
+  kable_styling("striped")
+```
+
+
+
+## Load data into SoupX
+
+SoupX estimates background reads by using empty droplets, and corrects to remove them from all cells. We use this correction because in this prep, as is common for nuclei preps (vs cellular preps), lysing cells led to lots of cell-free RNAs. See the cellranger warning "high percentage of reads not in cells"
+
+With reference to [SoupX tutorial](https://github.com/constantAmateur/SoupX/blob/master/vignettes/pbmcTutorial.Rmd). See also my soupX-seurat.Rmd for a more thorough exploration of how count matrix was affected, following the full tutorial.
+
+
+```{r SoupX, message=FALSE}
+
+#load data to SoupX
+FRT.raw <- lapply(ids, function(i){
+  FRT_raw <- load10X(file.path(dataset_loc, i,"/outs/"))
+})
+names(FRT.raw) <- ids
+
+ME_raw = autoEstCont(FRT.raw$ME)
+ME_cleaned = adjustCounts(ME_raw)
+
+PAN_raw = autoEstCont(FRT.raw$PAN)
+PAN_cleaned = adjustCounts(PAN_raw)
+
+FRT.cleaned <- list(ME_cleaned, PAN_cleaned)
+names(FRT.cleaned)<- ids
+
+```
+
+
+# Effects of SoupX cleaning
+-used automated implementation, did not provide known marker genes
+-similar estimated contamination fraction across population samples (rho = .12 in ME; 0.13 in PAN)
+-around 3K out of ~12K genes have completely unmodified expression after running SoupX. ~1K of these are unmodified in both pops. Unaffected genes all have relatively low expression (always <170 counts)
+-no genes were completely removed
+-The most severely affected genes were reduced by ~63% (ME) or 70% (PAN). Heavily corrected genes are mostly unnamed genes, but also include tubulin and a chitin binding gene.
+
+
+
+
+# Recreate cellranger barcode rank plots
+
+```{r fig_barcode_umi_original}
+#cr_filtered_cells <- rep(2000, length(ids))
+cr_filtered_cells <- as.numeric(gsub(",","",as.character(unlist(sequencing.metrics["Estimated Number of Cells",]))))
+names(cr_filtered_cells) <- ids
+xbreaks <- 10 ** c(0:6)
+xlabels <- as.character(xbreaks)
+ybreaks <- sort(c(1, 2, 5) * rep(xbreaks, 3))
+ylabels <- as.character(ybreaks)
+
+
+lapply(ids, function(i){
+  data.frame(index = seq.int(1, ncol(FRT.cleaned[[i]])),
+             nCount_RNA = sort(Matrix:::colSums(FRT.cleaned[[i]]) + 1,
+                               decreasing = TRUE),
+             nFeature_RNA = sort(Matrix:::colSums(FRT.cleaned[[i]] > 0) + 1,
+                                 decreasing = TRUE)) %>%
+    pivot_longer(cols = c("nCount_RNA", "nFeature_RNA")) %>%
+    ggplot() +
+    geom_line(aes(x = index,
+                  y = value,
+                  color = name,
+                  alpha = index > cr_filtered_cells[i])) +
+    scale_color_manual(values=c("red2","blue4"),
+                       labels=c("UMI", "Features"),
+                       name=NULL) +
+    scale_alpha_manual(values = c(1, 0.1)) +
+    ggtitle(paste0("Barcode rank plot: ", i)) +
+    xlab("Barcodes") +
+    ylab("Counts (UMI or Features)") +
+    scale_x_continuous(trans = 'log2', breaks=xbreaks, labels = xlabels) +
+    scale_y_continuous(trans = 'log2', breaks=ybreaks, labels = ylabels)
+})
+rm(xbreaks, xlabels, ybreaks, ylabels, cr_filtered_cells, experiment.metrics, sequencing.metrics)
+```
+
+## Seurat initial inspection
+
+# load data into seurat
+Simultaneously remove genes that are not expressed in at least 3 cells, which makes the data objects smaller. Merge the two libraries for purposes of initial cell clustering--otherwise it's more work to tell which clusters are the key polyploid ones to preserve through doublet_finder. Then split by library to actually run doublet_finder, because cross-replicate doublets aren't possible, then re-merge after removing doublets.
+
+```{r make seurat object}
+ME <- CreateSeuratObject(ME_cleaned, project = "ME")
+PAN <- CreateSeuratObject(PAN_cleaned, project = "PAN")
+
+ME@meta.data$orig.ident <- rep("ME",length(ME$orig.ident))
+PAN@meta.data$orig.ident <- rep("PAN",length(PAN$orig.ident))
+
+FRT.combined <- merge(ME, PAN)
+
+#Drop genes that are irrelevant to this experiment (nonexpressed) while the data is merged, to ensure the same genes are dropped in both replicates.
+counts <- GetAssayData(FRT.combined, slot="counts", assay="RNA")
+genes.percent.expression <- rowMeans(counts>0)*100
+
+genes.filter <- names(genes.percent.expression[genes.percent.expression>.00013])  #select genes expressed in roughly corresponding to 3 cells (.00013% of cells)
+counts.sub <- counts[genes.filter,]
+FRT.combined <- CreateSeuratObject(counts=counts.sub)
+
+#fix the barcode names to indicate which replicate they came from
+last.word <- function(barcode){
+  unlist(strsplit(barcode, "-"))[2]
+}
+bc_ends<-sapply(colnames(FRT.combined),last.word)
+pop<-case_match(bc_ends, "1_1" ~"ME", "1_2" ~"PAN")
+
+FRT.combined@meta.data$orig.ident <- pop
+
+```
+
+Remove some now unneeded big objects to save memory
+```{r free memory}
+
+rm(FRT.raw)
+rm(FRT.cleaned)
+rm(ME_raw, ME_cleaned, PAN_cleaned, PAN_raw)
+```
+
+
+Calculate mitochondrial contamination, toward removing distressed nuclei.
+
+```{r get % mito}
+MT_genes <- read.table('/data/rthayer/references/all-Dmel-mtgenes.txt')
+MT_genes_str <- apply(MT_genes, 1, toString)
+
+FRT.combined[["percent.mt"]] <- PercentageFeatureSet(FRT.combined, features = MT_genes_str, assay="RNA")
+
+rm(MT_genes)
+```
+
+# Some initial plots, before filtering:
+
+```{r violins1, warning=FALSE,error=FALSE,message=FALSE}
+VlnPlot(FRT.combined, features=c("nFeature_RNA", "nCount_RNA","percent.mt"),
+  ncol = 3, pt.size = 0.1)
+```
+
+
+
+Another look at sample quality, and which cells have most mitochondrial contamination
+
+```{r pre-filter visuals}
+metadata <- FRT.combined@meta.data
+metadata %>% 
+  ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mt)) + 
+  geom_point(size=0.7) + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() 
+
+```
+
+Filters to remove suspicious cells: check how many cells will be dropped, then do it. The mito filter is based on plots just made, above. The nFeature_RNA minimum filter is based on elbow plots. The max nCount_RNA is based on plots in my SNP_to_Doublet pipeline, which saw that everything above that size is not only an outlier large size; but also has high heterozygosity.
+
+```{r feature filters}
+table(FRT.combined@meta.data$percent.mt<2 & FRT.combined@meta.data$nFeature_RNA > 275 & FRT.combined@meta.data$nCount_RNA < 30000)
+
+
+FRT.combined <- subset(FRT.combined, subset= nFeature_RNA > 275 & nCount_RNA < 30000 & percent.mt <2)
+
+```
+
+Updated visuals post-filtering:
+
+```{r violins2, warning=FALSE,error=FALSE,message=FALSE}
+VlnPlot(
+  FRT.combined,
+  features = c("nFeature_RNA", "nCount_RNA","percent.mt"),
+  ncol = 3, pt.size = 0.1)
+
+```
+
+
+Create metadata about cell cycle variation. This will not be used to remove any cells, but might have been used to regress out expression variation in cell cycle genes before clustering. In practice because polyploidy and endocycle seem like important, real, variable attributes among cell types, no corrections or filters based on cell cycle variation were applied.
+
+```{r Cell cycle}
+cc_file <- getURL("https://raw.githubusercontent.com/hbc/tinyatlas/master/cell_cycle/Drosophila_melanogaster.csv") 
+cell_cycle_genes <- read.csv(text = cc_file)
+#write.csv(cell_cycle_genes, file = "/data/rthayer/FRT_unmated_nuclei/cell_cycle_genes.csv")
+s_genes = cell_cycle_genes[which(cell_cycle_genes$phase == "S"),2]
+g2m_genes = cell_cycle_genes[which(cell_cycle_genes$phase == "G2/M"),2]
+
+FRT.combined <- CellCycleScoring(FRT.combined, g2m.features = g2m_genes, s.features = s_genes)
+#make metadata for a gentler filter which will retain information about cycling vs quiescent cells, but remove info about which stage among the cycling cells.
+FRT.combined$CC.Difference <- FRT.combined$S.Score - FRT.combined$G2M.Score
+
+rm(cc_file, cell_cycle_genes)
+
+```
+
+## Normalize and scale data
+
+This is preliminary, toward clusters that can be used by the Doublet_finder package
+
+# standard way
+
+Allowing it to use all genes in variable features. The only reason to use a subset of genes in variable features is if runtime is prohibitive with all included. This is because invariant genes will likely get loaded into nonsignificant principal components anyway, so no reason to be stingy here. I'm not regressing on nFeature nor using SCTransform, because I expect biologically real differences in total transcript numbers between cell types, related to variable cell type ploidy. Not regressing out CC.Difference (cell cycle signal), again because of polyploidy
+
+```{r normalize}
+
+FRT.combined <- NormalizeData(FRT.combined, verbose=FALSE)
+FRT.combined <- FindVariableFeatures(FRT.combined, selection.method="vst", nfeatures=12300, verbose=FALSE)
+FRT.combined<- ScaleData(FRT.combined, vars.to.regress=c("percent.mt"), verbose=FALSE)
+
+```
+
+## Initial clustering
+Pre-doublet removal
+# PCA 
+and initial visual
+
+```{r PCA initial}
+FRT.combined <- RunPCA(FRT.combined, verbose=FALSE, npcs=100)
+#FRT.list$PAN <- RunPCA(FRT.list$PAN, verbose=FALSE, npcs=100)
+
+DimPlot(FRT.combined, reduction="pca", group.by="Phase", shuffle = TRUE)+ggtitle("pre-doublets res 1.5 75 pc")
+
+
+```
+
+# Metrics to decide # PCA dimensions to use
+
+
+```{r Elbow, fig.width=10}
+ElbowPlot(FRT.combined, ndims=100)
+#ElbowPlot(FRT.list$PAN, ndims=100)+ggtitle("PAN")
+
+#FRT.list$ME <- JackStraw(FRT.list$ME, num.replicate = 100, dims =80)
+#FRT.list$ME <- ScoreJackStraw(FRT.list$ME, dims = 1:80)
+#JackStrawPlot(FRT.list$ME, dims = 1:80)+ggtitle("PAN")
+```
+
+# Clustering
+
+```{r Clusters initial, message=FALSE}
+use.pcs=1:75
+FRT.combined <- FindNeighbors(FRT.combined, reduction = "pca", dims = use.pcs)
+
+```
+
+A look at clustering resolution
+
+```{r choose resolution, fig.height=8}
+FRT.combined <- FindClusters(FRT.combined, resolution =seq(0.5,4,0.5), verbose=FALSE)
+clustree(FRT.combined, prefix = "RNA_snn_res.", node_colour = "sc3_stability", node_label = "nCount_RNA", node_label_aggr= 'median',node_label_size = 2)
+
+```
+
+# Choose a resolution and visualize clusters
+
+```{r plot umap, warning=FALSE,error=FALSE,message=FALSE}
+FRT.combined <- FindClusters(FRT.combined, resolution =1.5, verbose=FALSE)
+
+FRT.combined <- RunUMAP(FRT.combined, reduction = "pca", dims = use.pcs, verbose=FALSE)
+
+DimPlot(FRT.combined, reduction="umap", label=TRUE)+ggtitle("combined res 1.5, 75 pcs")
+
+FRT.combined <- BuildClusterTree(
+  FRT.combined, dims = use.pcs)
+
+PlotClusterTree(FRT.combined)
+
+```
+
+2: cell cycle phase and % mitochondrial gene by cluster
+
+```{r plot umap 2}
+
+DimPlot(FRT.combined, label=TRUE, group.by = "Phase")
+FeaturePlot(FRT.combined, feature="percent.mt")
+
+```
+
+3: early PCA dimensions; separation by cluster
+
+```{r plot umap 3}
+DimPlot(FRT.combined, label=TRUE, dims=c(1:2), reduction="pca")
+DimPlot(FRT.combined, label=TRUE, dims=c(3:4), reduction="pca")
+
+```
+
+4: feature count per cluster
+Helpful to determine which clusters are the polyploid ones, to retain through the doublet Finder process
+
+```{r plot clusters}
+
+VlnPlot(FRT.combined, features = c("nFeature_RNA"), ncol = 1, pt.size=0.1)
+
+```
+
+
+These are preliminary clusters to use with doublet finder, so won't bother refining or defining them yet. 
+
+## Doublet Finder
+
+Now separate the object by replicate (i.e. population of origin) again, since doublets between separate runs aren't possible.
+
+```{r original doublet finder M}
+
+#separate by replicate
+FRT_ME <- subset(FRT.combined, subset = orig.ident=="ME")
+FRT_PAN <- subset(FRT.combined, subset = orig.ident=="PAN")
+
+#apply doubletFinder
+library(DoubletFinder)
+use.pcs=1:75
+sweep.res.list.ME <- paramSweep_v3(FRT_ME, PCs = use.pcs, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list.ME, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+#compute the maxima (it agrees with the plot, whose unprinted x axis labels span pK .001 to 0.3)
+pK=as.numeric(as.character(bcmvn$pK))
+BCmetric=bcmvn$BCmetric
+pK_choose_ME = pK[which(BCmetric %in% max(BCmetric))]
+
+#graph it better
+par(mar=c(5,4,4,8)+1,cex.main=1.2,font.main=2)
+plot(x = pK, y = BCmetric, pch = 16,type="b",
+     col = "blue",lty=1)
+abline(v=pK_choose_ME,lwd=2,col='red',lty=2)
+title("BCmvn distribution ME")
+text(pK_choose_ME,max(BCmetric),as.character(pK_choose_ME),pos = 4,col = "red")
+
+#for ME, assuming 6.9% of 8900 cells (that's post-filtering numbers, unclear whether 10x intends the rate for 10K cells prefiltering, which would be 8% doublet rate)
+#based on 10x user guide multiplet estimate rate for the # of cells sequenced, per their barnyard experiments.
+nExp_poi <- round(0.069*nrow(FRT_ME@meta.data))  
+# estimate how many homotypic doublets, adjust rate for these, as DF doesn't identify them
+homotypic.prop <- modelHomotypic(FRT_ME@meta.data$seurat_clusters)          
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+#run doublet finder-- it creates artificial doublets. Number of fakes determined by pN, which is the default setting
+#Based on neighbor nearness to the simulated fake doublets, it decides which of your droplets are doublets
+FRT_ME <- doubletFinder_v3(FRT_ME, PCs = use.pcs, pN = 0.25, pK = pK_choose_ME, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+
+#Optionally, add doublet-ness scores to metadata for downstream option to compare them to cluster IDs
+#AddMetaData(FRT_ME, sweep.res.list.ME$pN_0.25_pK_0.01$pANN, col.name='ME_pANN')
+
+```
+Left to its own devices, the doublet_finder in PAN now weirdly chooses a neighborhood size of .18 instead of .01; wild difference. This results in choosing 500 doublets in the fat body, few in several other suspicious clusters, and completely sparing the ST/PV pp clusters. I think it's probably still wrong; too harsh on fat body. It completely removes the signal that the fat body is polyploid. Regarding choosing which pK is right, the writer says it's experiment specific and apart from running the BCMVN thing, only way to know is external knowledge of the ground truth on whether it removes the correct clusters. ME still picks the original pK .01. PAN also now has strikingly bimodal BCmv, so there is still an argument for .01 to be chosen for PAN. Going to use .01 in both for consistency, and because it's straightforward for me to keep the small polyploid clusters (AGSC and SSC), but not straightforward for me to keep a subset of the probably-wrongly-implicated fat body cells.
+
+```{r original doublet finder P}
+#apply DoubletFinder
+sweep.res.list.PAN <- paramSweep_v3(FRT_PAN, PCs = use.pcs, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list.PAN, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+#compute the maxima (it agrees with the plot, whose unprinted x axis labels span pK .001 to 0.3)
+pK=as.numeric(as.character(bcmvn$pK))
+BCmetric=bcmvn$BCmetric
+pK_choose = pK[which(BCmetric %in% max(BCmetric))]
+#graph it better
+par(mar=c(5,4,4,8)+1,cex.main=1.2,font.main=2)
+plot(x = pK, y = BCmetric, pch = 16,type="b",
+     col = "blue",lty=1)
+abline(v=pK_choose,lwd=2,col='red',lty=2)
+title("BCmvn distribution PAN")
+text(pK_choose,max(BCmetric),as.character(pK_choose),pos = 4,col = "red")
+
+#for PAN, assuming 8% of ~15k cells are doublets. I previously assumed 11% for PAN because the rate of doublets goes up dramatically with the number of cells; can no longer find any table that reports the empirical doublet rate if you've gone above the manufacturer's recommended 10K cells maximum per lane. So, this may be under-identifying doublets.
+nExp_poi <- round(0.08*nrow(FRT_PAN@meta.data))  
+# estimate how many homotypic doublets, adjust rate for these, as DF doesn't find them
+homotypic.prop <- modelHomotypic(FRT_PAN@meta.data$seurat_clusters)          
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+#run doublet finder-- it creates artificial doublets and decides which of your doublets are most similar to the artificial doublets.
+FRT_PAN <- doubletFinder_v3(FRT_PAN, PCs = use.pcs, pN = 0.25, pK = .01, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+
+```
+
+Inspect the doublet designations
+
+```{r compare}
+#on UMAP plot: binary doublet assignment
+#doublet finder
+DimPlot(FRT_PAN, split.by="DF.classifications_0.25_0.01_1134", reduction="umap", pt.size=0.1)+ggtitle("PAN")
+DimPlot(FRT_ME, split.by="DF.classifications_0.25_0.01_584", reduction="umap", pt.size=0.1)+ggtitle("ME")
+
+
+#proportions per cell type
+table(Idents(FRT_PAN))
+plot(table(Idents(FRT_PAN)), main="PAN")
+just_doubs <- subset(FRT_PAN, DF.classifications_0.25_0.01_1134=='Doublet')
+plot(table(Idents(just_doubs)), main="PAN_doublets")
+
+table(Idents(FRT_ME))
+plot(table(Idents(FRT_ME)), main="ME")
+just_doubs_ME <- subset(FRT_ME, DF.classifications_0.25_0.01_584=='Doublet')
+plot(table(Idents(just_doubs_ME)), main="ME doublets")
+
+VlnPlot(FRT_ME, feature="nCount_RNA", split.by="DF.classifications_0.25_0.01_584")+ggtitle("RNA count ME")
+VlnPlot(FRT_PAN, feature="nCount_RNA", split.by="DF.classifications_0.25_0.01_1134")+ggtitle("RNA count PAN")
+
+
+```
+
+Remove all putative doublets except the SSC and AGSC polyploid clusters
+
+```{r removal}
+
+#remove doub_finder doublets
+#simultaneously filter on nCount_RNA. The thresholds are based on first running this step without a filter, checking violin plots afterward, and seeing some lingering outlier very-high RNA cells, relative to their cell type, which are under suspicion of also being doublets, so are here removed to be conservative.
+PAN_singlets <- subset(FRT_PAN, subset= DF.classifications_0.25_0.01_1134 =='Singlet' & seurat_clusters %in% c(0:3,5:30,33,35) & nCount_RNA < 6500)
+
+PAN_fat <- subset(FRT_PAN, subset= DF.classifications_0.25_0.01_1134 =='Singlet' & seurat_clusters %in% c(4,32) & nCount_RNA < 12500)
+PAN_pp <- subset(FRT_PAN, subset=seurat_clusters %in% c(31,34) & nCount_RNA < 12500)
+
+ME_singlets <- subset(FRT_ME, subset= DF.classifications_0.25_0.01_584 =='Singlet' & seurat_clusters %in% c(0:3,5:30,33,35) & nCount_RNA < 6500)
+
+ME_fat <- subset(FRT_ME, subset= DF.classifications_0.25_0.01_584 =='Singlet' & seurat_clusters %in% c(4,32) & nCount_RNA < 12500)
+ME_pp <- subset(FRT_ME, subset=seurat_clusters %in% c(31,34) & nCount_RNA < 12500)
+
+ME_singlets <- merge(ME_singlets, ME_pp)
+ME_singlets <- merge(ME_singlets, ME_fat)
+PAN_singlets <- merge(PAN_singlets, PAN_pp)
+PAN_singlets <- merge(PAN_singlets, PAN_fat)
+VlnPlot(PAN_singlets, feature="nCount_RNA")
+```
+
+Re-merge the replicates and redo the clustering 
+Redo all normalizing, scaling, etc after having removed doublets.
+```{r two pop making}
+FRT.combined <- merge(ME_singlets, PAN_singlets)
+
+FRT.combined <- NormalizeData(FRT.combined, verbose=FALSE)
+FRT.combined <- FindVariableFeatures(FRT.combined, selection.method="vst", nfeatures=12300, verbose=FALSE)
+FRT.combined<- ScaleData(FRT.combined, verbose=FALSE)
+FRT.combined <- RunPCA(FRT.combined, verbose=FALSE, npcs=100)
+use.pcs=1:75
+FRT.combined <- FindNeighbors(FRT.combined, reduction = "pca", dims = use.pcs)
+FRT.combined <- FindClusters(FRT.combined, resolution =1.5, verbose=FALSE)
+FRT.combined <- RunUMAP(FRT.combined, reduction = "pca", dims = use.pcs, verbose=FALSE)
+
+DimPlot(FRT.combined, reduction="umap", label =TRUE, split.by="orig.ident")
+VlnPlot(FRT.combined, feature="nCount_RNA", split.by="orig.ident")
+
+```
+
+Save the object for the analysis phase
+
+```{r save_rdata, eval=TRUE}
+save(FRT.combined, file="/data/rthayer/FRT_unmated_nuclei/reduction_wdenovo_Mar24ReRun.RData")
+```
+
+
+## References
+
+lots of [seurat](satijalab.org/seurat) tutorials
+[UC Davis Genomics Core training 2022](https://ucdavis-bioinformatics-training.github.io/2022-March-Single-Cell-RNA-Seq-Analysis/data_analysis/scRNA_Workshop-PART5_fixed)
+
+
+
+## Session Information
+
+```{r sessioinfo}
+sessionInfo()
+```
