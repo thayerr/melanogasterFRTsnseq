@@ -1,0 +1,1078 @@
+---
+title: "FRT_unmated_sn_analysis_final"
+author: "Rachel Thayer"
+date: "updated August 2024"
+output: html_document
+---
+## About
+
+After data cleaning, this code identifies and annotates cell types, explores their attributes, and recreates figures from the manuscript. See accompanying publication Thayer et al 2024 "Regional specialization, polyploidy, and seminal fluid transcripts in the Drosophila female reproductive tract"
+
+
+Load packages
+```{r, warning=FALSE,error=FALSE,message=FALSE, echo=FALSE}
+library(Seurat)
+library(patchwork)
+library(limma)
+library(ggplot2)
+library(Matrix)
+library(dplyr)
+library(RCurl)
+library(clustree)
+library(tidyr)
+library(kableExtra)
+library(ape)
+library(topGO)
+library(stringr)
+library(dendextend)
+#library(rstatix) #used in the later analysis stages; load it only then or else it changes the clustering
+```
+
+# Load data. 
+You can reload the output of the cleaning/filtering code to reproduce the full analysis.
+
+```{r load rdata}
+set.seed(12345)
+load("/data/rthayer/FRT_unmated_nuclei/reduction_wdenovo_Mar24ReRun.RData")
+
+#optionally, load a pre-analyzed object to interact with the dataset, make custom figures, etc. This is the full set of clusters, including those inferred to be artefacts. The data object is too large to upload to GitHub.
+#load("interactable_Seurat_full.RData")
+
+
+```
+
+Re-inspect the data with all final filtering:
+
+```{r post-filter visuals}
+metadata <- FRT.combined@meta.data
+metadata %>% 
+  ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mt)) + 
+  geom_point(size=0.7) + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() 
+
+VlnPlot(FRT.combined, features=c("nCount_RNA","nFeature_RNA", "percent.mt"), group.by="orig.ident")
+```
+## Cluster stability
+```{r choose resolution, fig.height=8}
+use.pcs=1:75
+#FRT.combined <- FindNeighbors(FRT.combined, reduction = "pca", dims = use.pcs)
+FRT.combined <- FindClusters(FRT.combined, resolution =seq(0.5,4,0.5), verbose=FALSE)
+clustree(FRT.combined, prefix = "RNA_snn_res.", node_colour = "sc3_stability", node_label = "nCount_RNA", node_label_aggr= 'median',node_label_size = 2)
+
+```
+# Choose a resolution and visualize clusters
+1: clusters per pop
+going to use res=1.5
+
+```{r plot umap, warning=FALSE,error=FALSE,message=FALSE}
+Idents(FRT.combined)<- "RNA_snn_res.1.5"
+
+#FRT.combined <- RunUMAP(FRT.combined, reduction = "pca", dims = use.pcs, verbose=FALSE)
+DimPlot(FRT.combined, reduction="umap", label=TRUE, group.by ="orig.ident", shuffle=TRUE)
+
+DimPlot(FRT.combined, reduction="umap", label=TRUE, split.by ="orig.ident")
+
+DimPlot(FRT.combined, label=TRUE, reduction="umap")
+```
+
+## Name the clusters
+
+Cluster names include leading numbers so that they will be plotted in my preferred order during figure-making
+```{r rename clusters}
+#save old identity classes
+FRT.combined[["old.ident"]] <- Idents(object=FRT.combined)
+
+
+FRT.combined <- RenameIdents(object=FRT.combined, '0'="20-UT-mid2",'1'="21-UT-mid3", '2'='00-OV-1', '3'="03-SR-prox1", '4'="04-SR-prox2", '5'='17-UT-ant1', '6'='25-FB','7'='28-MUS1', '8'='16-UT-to-SR','9'='24-UT-mem','10'='22-UT-mid4', '11'='01-OV-2','12'='10-ST-ep', '13'='29-MUS2','14'='06-SR-dist1', '15'='39-artefact-2', '16'='11-ST-AG-duct','17'='23-UT-post','18'='33-hemocyte','19'='30-MUS3','20'='40-artefact-3','21'='15-UT-PE','22'='41-SSC-like','23'='02-OV-3','24'='14-UT-to-ST','25'='05-SR-prox3','26'='07-SR-dist2','27'='31-MUS4','28'='18-UT-ant2','29'='34-glia','30'='32-MUS5','31'='08-SSC', '32'='19-UT-mid1', '33'='35-trachea','34'='12-AGSC','35'='36-neuron', '36'='37-oenocyte')
+
+my_levels <- c('00-OV-1', '01-OV-2', '02-OV-3', '03-SR-prox1', '04-SR-prox2', '05-SR-prox3', '06-SR-dist1', '07-SR-dist2', '08-SSC',   '10-ST-ep', '11-ST-AG-duct', '12-AGSC',   '14-UT-to-ST', '15-UT-PE', '16-UT-to-SR', '17-UT-ant1', '18-UT-ant2', '19-UT-mid1', '20-UT-mid2', '21-UT-mid3', '22-UT-mid4', '23-UT-post', '24-UT-mem', '25-FB', '28-MUS1', '29-MUS2', '30-MUS3', '31-MUS4', '32-MUS5', '33-hemocyte', '34-glia', '35-trachea', '36-neuron', '37-oenocyte','38-artefact','39-artefact-2', '40-artefact-3', '41-SSC-like', '42-AGSC-like') #'09-SSC-like', '13-PSC-like', 'artefact'
+
+levels(FRT.combined)<- factor(my_levels)
+
+#coordinate colors with organ-level identities for plotting
+#(OV= 3 green, SR = 5 yellow, ST =orange, PV= blue, UT = 9 pink-red, FB = 1 , non-repro = greyscale)
+library(scales)
+show_col(hue_pal()(37))
+#set my colors
+my_cols <- c('00-OV-1'='#3FB500', '01-OV-2'='#00BECC', '02-OV-3'='#00BC4F', '03-SR-prox1'='#FADA5E', '04-SR-prox2'='#FFF200', '05-SR-prox3'='#FEE12B', '06-SR-dist1'='#FCE205', '07-SR-dist2'='#FCD12A', '41-SSC-like'='#F17D51', '08-SSC'='#DF8B00', '10-ST-ep'='#E98429', '11-ST-AG-duct'='#00AAFE', '12-AGSC'='#30A2FF', '42-AGSC-like'='#30A2FF','14-UT-to-ST'='#F8766D', '15-UT-PE'='#FD6F85', '16-UT-to-SR'='#DE70F9', '17-UT-ant1'='#FF64AF', '18-UT-ant2'='#B584FF', '19-UT-mid1'='#FD61D2', '20-UT-mid2'='#FF699B', '21-UT-mid3'='#EC68EE', '22-UT-mid4'='#F663E1', '23-UT-post'='#CC7AFF', '24-UT-mem'='#FF61C1', '25-FB'='#AAA300', '39-artefact-2'='#8b6c5c', '40-artefact-3'='#6a4a3a', '28-MUS1'='#cccccc', '29-MUS2'='#bbbbbb', '30-MUS3'='#aaaaaa', '31-MUS4'='#999999', '32-MUS5'='#888888', '33-hemocyte'='#777777', '34-glia'='#444444', '35-trachea'='#333333', '36-neuron'='#666666', '37-oenocyte'='#555555','38-artefact'='#4c3228')
+
+my_cols2 <- my_cols[names(my_cols)]
+show_col(my_cols2)
+
+DimPlot(FRT.combined, label=TRUE, cols=my_cols2)
+
+```
+
+# Define useful diagnostic marker genes before manually correcting the clusters
+```{r define feature sets}
+# in situ marker genes, split among three groups to have a manageable number per figure panel
+Fig_markers = c("FBgn0010015","FBgn0267253","FBgn0087002","FBgn0284084","FBgn0003448","FBgn0260642", "FBgn0031918","FBgn0042627","FBgn0250908","FBgn0037577","FBgn0003255","FBgn0036659","FBgn0261848", "FBgn0031406")
+Second_half = c("FBgn0262572","FBgn0028482","FBgn0285913","FBgn0032494","FBgn0039178","FBgn0042186","FBgn0029123","FBgn0038007","FBgn0031737","FBgn0011695","FBgn0032285","FBgn0039479","FBgn0261698","FBgn0036752","FBgn0039311")
+Third_half = c("FBgn0031080","FBgn0264908","FBgn0000046","FBgn0034162", "FBgn0010470","FBgn0262536", "FBgn0261989", "FBgn0032494", "FBgn0027586", "FBgn0261698", "FBgn0011695")
+
+
+# sperm and sfp gene lists
+# update hard-coded paths here to use supplemental datasets from the accompanying publication
+SFP_genes <- read.table("/alpha/julie/Mel_DE/Lists/Wigby_list")
+SFP_genes <- SFP_genes$V1
+exp_SFP_genes <- SFP_genes %in% rownames(FRT.combined[["RNA"]])
+sfp_ids <-SFP_genes[exp_SFP_genes] #length of this is an initial estimate of the # of SFPs expressed by the FRT, though this does not yet have a vigorous filter on expression level and includes some trace-detectable genes
+FRT.combined[["percent.sfp"]] <- PercentageFeatureSet(FRT.combined, features = sfp_ids, assay="RNA")
+sperm_assoc_pre <- read.csv(file="/data/rthayer/references/pnas.2119899119.sd03.txt", sep='\t') #Dataset S3 from McCullough et al PNAS
+exp_sperm_assoc <- sperm_assoc_pre$FBgn_id %in% rownames(FRT.combined[["RNA"]])
+sperm_assoc <- sperm_assoc_pre$FBgn_id[exp_sperm_assoc]
+FRT.combined[["sperm_assoc"]] <-PercentageFeatureSet(FRT.combined, features=sperm_assoc, assay="RNA")
+
+```
+
+# Subset one of the artefact clusters
+This was initially done to see whether there might be some real SSC / AGSC cells mixed into the artefact cluster, and if so, try to recover them. I was not able to convince myself that these subsets are real SSC / AGSC cells, rather than doublets that include an SC cell. However the subclusters are kept separate so that their attributes can be easily queried, in case future work wants to revisit the issue. I still think it might be possible that the '41-SSC-like' and '09' are, or include, some real SC cells that are in a different expression or endoreplication state.
+```{r split SSC}
+SSC <- subset(FRT.combined, idents='41-SSC-like')
+use.pcs=1:75
+SSC <- FindNeighbors(SSC, reduction = "pca", dims = use.pcs)
+SSC <- FindClusters(SSC, resolution =0.5, verbose=FALSE) #see also res 0.2 to get only 2 subclusters
+#inspect
+DimPlot(SSC)
+#optinoally, can check attributes of the potential sub-clusters like so:
+#DotPlot(SSC, features=endocycle_genes)
+#VlnPlot(SSC, feature='nCount_RNA')
+#VlnPlot(SSC, feature='percent.sfp')
+#VlnPlot(SSC, feature='sperm_assoc')
+#VlnPlot(SSC, feature='f_uniq_sperm_assoc')
+DotPlot(SSC, features=Fig_markers)+RotatedAxis() # example for one marker gene set; checked them all
+table(Idents(SSC))
+#check my validated SSC vs AGSC markers:
+DotPlot(SSC, feature='FBgn0031406') #Send1
+DotPlot(SSC, feature='FBgn0261848') #in situ'd AGSC marker
+VlnPlot(SSC, feature='FBgn0261848')
+# Conclusions: sub-cluster with the ID 3 look quite AGSC-like, though it doesn't hold up so well when inspected again, back in the context of the full dataset. 2 = SSC like, though may still have contamination. 0-1 are ambiguous mess and presumed artefacts
+ 
+# set cluster IDs for the affected barcodes in the full dataset to match these potentially interesting sub-clusters
+#back up the original cell IDs
+FRT.combined$CellType <- Idents(FRT.combined)
+#add factor levels to the main data object in preparation
+levels(FRT.combined$CellType)<- c(levels(FRT.combined$CellType),'38-artefact','42-AGSC-like') #can not simply do levels <- my_levels as it will shuffle and rename all previously defined factors to match the order of my_levels. Must add new ones on the end of the list in order.
+
+#reassign the subsets of this cluster. For some reason adding factor levels to Ident directly doesn't work; have to update my metadata CellType column and then later copy it over to Idents. 
+corrected_nonSSC <- WhichCells(SSC, ident=c('0','1'))
+FRT.combined$CellType[corrected_nonSSC] <-'38-artefact' 
+
+nonendo_AGSC <- WhichCells(SSC, ident='3')
+FRT.combined$CellType[nonendo_AGSC] <-'42-AGSC-like' 
+
+#further evaluate whether AGSC-like and SSc-like really are AGSC and SSC, in context of the full dataset
+#DotPlot(FRT.combined, group.by='CellType', features=Fig_markers)+RotatedAxis()
+#4 top AGSC markers 
+DotPlot(FRT.combined, group.by='CellType',features=c('FBgn0261848','FBgn0038404','FBgn0261615','FBgn0035678'))+RotatedAxis()
+
+#put corrected cell IDs back into Idents
+Idents(FRT.combined)<-FRT.combined$CellType
+#sort factor levels for nice plotting order
+levels(FRT.combined)<- factor(my_levels)
+#subset to the set of confirmed cell types for use in analyses, while still separately retaining the full dataset that includes the probable artefacts 
+FRT.combined.full <- FRT.combined
+FRT.combined <- subset(FRT.combined.full, idents=c('39-artefact-2','40-artefact-3','38-artefact','42-AGSC-like','41-SSC-like'),invert=TRUE )
+
+```
+
+An attempt at investigating another one of the artefact clusters
+```{r snoop suspicious, eval=FALSE}
+sus <- subset(FRT.combined.full, idents='40-artefact-3')
+use.pcs=1:75
+sus <- FindNeighbors(sus, reduction = "pca", dims = use.pcs)
+sus <- FindClusters(sus, resolution =0.5, verbose=FALSE) #see also res 0.2 to get only 2 subclusters
+#inspect
+DimPlot(sus)
+#view all in situ marker genes; conclude that all subsets of this are doublet nonsense that purportedly coexpress mutually exclusive combinations of validated markers
+DotPlot(sus, features=Fig_markers)+RotatedAxis()
+DotPlot(sus, features=Second_half)+RotatedAxis()
+
+#Compare to DoubletFinder scores 
+VlnPlot(subset(FRT.combined.full, subset=orig.ident == 'PAN'), feature='pANN_0.25_0.01_1134')
+
+```
+
+
+# Plot some basic attributes
+
+2: cell cycle phase and % mitochondrial gene by cluster
+
+```{r plot umap 2}
+
+DimPlot(FRT.combined, label=TRUE, group.by = "Phase")
+FeaturePlot(FRT.combined, feature="percent.mt")
+VlnPlot(FRT.combined, features = c("nFeature_RNA"), ncol = 1, pt.size=0.1)
+
+
+```
+
+
+# Look at a tree of cluster similarity
+```{r create_tree, warning=FALSE,error=FALSE,message=FALSE}
+FRT.combined <- BuildClusterTree(
+  FRT.combined, dims = use.pcs)
+
+PlotClusterTree(FRT.combined)
+PlotClusterTree(FRT.combined, show.node.label=FALSE)
+
+
+FRT.combined.full <- BuildClusterTree(
+  FRT.combined.full, dims = use.pcs)
+PlotClusterTree(FRT.combined.full)
+
+```
+Plot the rest of the Fig. 1 panels
+
+```{r plot Fig 1}
+DimPlot(FRT.combined, label=TRUE, cols=my_cols2)
+DimPlot(FRT.combined, cols=my_cols2)+NoLegend()
+DimPlot(FRT.combined.full, label=TRUE, cols=my_cols2)
+
+```
+
+Plot Fig 2 DotPlot of in situ marker genes, also, the full in situ panels for the supplement
+save in situ keys at 5.5 x 8.5 pdf
+```{r plot Fig 2}
+DotPlot(FRT.combined, features=c("FBgn0028482","FBgn0000046","FBgn0087002","FBgn0032285","FBgn0039479","FBgn0011695","FBgn0261698","FBgn0036752","FBgn0031080","FBgn0038007","FBgn0031737","FBgn0261848","FBgn0003255","FBgn0036659","FBgn0031406","FBgn0285913","FBgn0262572","FBgn0031918","FBgn0250908", "FBgn0037577"))+RotatedAxis()+coord_flip()
+
+DotPlot(FRT.combined.full, features=Fig_markers)+RotatedAxis()
+DotPlot(FRT.combined.full, features=Second_half)+RotatedAxis()
+DotPlot(FRT.combined.full, features=Third_half)+RotatedAxis()
+#pool J addendum about paralogs for the supplement:
+#repeats poolJ and then 2 tandem paralogs to CG10513
+DotPlot(FRT.combined.full, features=c('FBgn0261698','FBgn0036752',"FBgn0039311","FBgn0039312","FBgn0039313"))+RotatedAxis()
+
+```
+
+
+# figures about endocycle and polyploidy 
+See Costa Deng 2022 review for discussion of the endocycle genes and pathways that are checked here.
+Save the VlnPlot as 9.28" w x 4.66" aspect ratio
+GO analysis that identifies some 'polytene' related enrichments is in a later code chunk.
+```{r endocycle fig}
+VlnPlot(FRT.combined, feature='nCount_RNA', cols=my_cols2)+NoLegend()
+
+endocycle_genes <- c('FBgn0262699','FBgn0010316','FBgn0003053','FBgn0262656','FBgn0015903','FBgn0031759','FBgn0000229','FBgn0034970') # inverse order: Fzr, Dap, Hnt, Myc, Apt, KDM5, Bsk, Yki
+DotPlot(FRT.combined, features=endocycle_genes, dot.scale=8) + RotatedAxis()+coord_flip()
+
+endocycle_genes_long <- c('FBgn0283499','FBgn0002121','FBgn0034970','FBgn0000229','FBgn0262656','FBgn0020224','FBgn0015903','FBgn0031759','FBgn0010316','FBgn0262699','FBgn0004198') #Inr, l(2)gl, Yki, Bsk, Myc, Cbl, Apt, KDM5, Dap, Fzr, Cut
+DotPlot(FRT.combined, features=endocycle_genes_long, dot.scale=8) + RotatedAxis()
+
+```
+
+# violin plots for Fig. 5
+and extras
+Save vln plots as size 5.6" tall x 10" wide (actually only need half the size but the device won't write things so small evidently)
+```{r violin plots}
+VlnPlot(FRT.combined, feature='percent.sfp', cols=my_cols2)+NoLegend()
+VlnPlot(FRT.combined, feature='sperm_assoc', cols=my_cols2)+NoLegend()
+
+f_uniq_sperm_assoc_pre <- sperm_assoc_pre$FBgn_id[which(sperm_assoc_pre$Uniquely.Female == 1)]
+exp_f_uniq_sperm_assoc <- f_uniq_sperm_assoc_pre %in% rownames(FRT.combined[["RNA"]])
+FRT.combined[["f_uniq_sperm_assoc"]] <-PercentageFeatureSet(FRT.combined, features=f_uniq_sperm_assoc_pre, assay="RNA")
+VlnPlot(FRT.combined, feature="f_uniq_sperm_assoc", cols=my_cols2)+NoLegend()
+
+#secretion
+#list of secreted genes is a supplemental dataset to the publication
+#Secretion gene list was originally generated by using signalP version 5 on the latest FlyBase annotation set to list all D. melanogaster peptides predicted to be secreted based on having a signal peptide. Then I used a python script to convert that to a list of *genes* with at least one predicted-secreted peptide product.
+secreted <- read.csv("/data/rthayer/references/secreted_genes.csv", header=FALSE, col.names="V1")
+exp_secrete <- secreted$V1 %in% rownames(FRT.combined[["RNA"]])
+secreted <- secreted$V1[exp_secrete]
+FRT.combined[["secreted"]] <- PercentageFeatureSet(FRT.combined, features = secreted, assay="RNA")
+
+#now determine genes that are secreted NON SFP / Sperm Proteome for the figure
+secreted_nonsfp <- setdiff(secreted, sfp_ids) #take things in group1 and NOT group2
+secreted_nonsfpSP <- setdiff(secreted_nonsfp, sperm_assoc_pre$FBgn_id)
+FRT.combined[["secreted_nonsfpSP"]] <- PercentageFeatureSet(FRT.combined, features = secreted_nonsfpSP, assay="RNA")
+VlnPlot(FRT.combined, feature="secreted_nonsfpSP", cols=my_cols2)+NoLegend()
+
+# Pull some values to report in the main text
+VlnPlot(FRT.combined, feature="percent.sfp", pt.size=0)+ stat_summary(fun.y=median, geom="text", aes(label=after_stat(as.integer(y))))+NoLegend()
+#see also this style
+VlnPlot(FRT.combined, feature="percent.sfp")+ stat_summary(fun.y=median, geom="point", size=15, colour="black", shape=95)+NoLegend()
+
+VlnPlot(FRT.combined, feature="f_uniq_sperm_assoc", pt.size=0)+ stat_summary(fun.y=median, geom="text", aes(label=after_stat(as.integer(y))))+NoLegend()
+
+#get numbers of SFPs in McDonough-Goldstein et al 2021's FRT proteome, using the supplemental dataset from that publication
+#every gene named in column 1 is in the female-derived proteome for at least one of their conditions (pre- and/or post-mating; fluid and/or tissue fraction)
+McDG_proteome <- read.csv('/data/rthayer/references/McDG_proteomic.csv')
+summary(McDG_proteome$primary_FBgn %in% SFP_genes)
+```
+
+## Writing out gene expression per cluster
+This is toward making the Supplemental Datasets 3-4. 
+The metadata and counts files are both needed as inputs to average_per_cluster.py, which computes the logCPM per gene per celltype, and the percent expressing cells per gene per cell type. **Outputs of average_per_cluster.py are used in later chunks in this .Rmd document!**
+I include the artefact clusters when writing these files
+
+Expression level formats available:
+The possible slots are counts, data, and scale.data. Counts is count-like data, back-transformed. Data is the log-normalized version of counts; all values will be >=0. Data is what 'find markers' command uses. scale.data is what PCA is computed from by Seurat; and in turn is what cluster assignments are based on; can have negative values. How it's computed depends on whether you used SCTransform or ScaleData. These values have effects of e.g. mito and cell cycle genes regressed out, if you used those regressions during the earlier data filtering.
+If you wanted counts per million, without the log normalizing, then you would re-run NormalizeData with normalization.method = "RC" (relative counts) and scale.factor=1e6
+I'm using the "data" slot
+```{r}
+#log normalized data
+write.table(as.matrix(GetAssayData(object=FRT.combined.full, slot="data")),'/data/rthayer/FRT_unmated_nuclei/seurat_data.csv', sep=",", row.names=T, col.names=T, quote=FALSE)
+
+#counts
+write.table(as.matrix(GetAssayData(object=FRT.combined.full, slot="counts")),'/data/rthayer/FRT_unmated_nuclei/counts.csv', sep=",", row.names=T, col.names=T, quote=F)
+
+#metadata including cluster IDs
+FRT.combined.full[["rename.ident"]] <- Idents(object=FRT.combined.full)
+write.csv(FRT.combined.full@meta.data,"/data/rthayer/FRT_unmated_nuclei/seurat_metadata_renamed.csv", quote=FALSE)
+
+#levels for cluster names to be used inside average_per_cluster.py
+#these are hard-coded in the python script; update them there if you've done an alternative clustering.
+levels(FRT.combined.full)
+```
+## pause and process outputs with python scripts!!
+
+# Determine the list of FRT-expressed genes and SFPs
+For numbers reported in main text, including the # of FRT-expressed SFPs, and for the denominator in SFP-related GO analysis
+```{r}
+#Read in the table of gene expression per cell type
+#make sure the input file has had the header manually added post being made by the script average_per_cluster.py, see explanation inside the python script
+per_cells <- read.table('/data/rthayer/FRT_unmated_nuclei/percent_expressing_per_cluster_renamed_colnames.txt', sep='\t', header=TRUE)
+per_cells <- rbind(colnames(per_cells), per_cells)
+per_cells_t <- as.data.frame(t(per_cells))
+colnames(per_cells_t) <- per_cells_t[1,]
+per_cells_t <- per_cells_t[-(1:2),]
+per_cells_t[2:length(per_cells_t)] <- lapply(per_cells_t[2:length(per_cells_t)], as.numeric)
+
+#optional: makes histogram of SFP expression levels in the FRT:
+#subset to SFPs and validated clusters
+# SFP_per_cells <- per_cells_t[which(per_cells_t$ClusterID %in% SFP_genes),which(colnames(per_cells_t) %in% levels(Idents(FRT.combined)))]
+#get max
+#SFP_per_cells$max <- apply(SFP_per_cells[,c(2:length(SFP_per_cells))], 1, max)
+#SFP_per_cells <- SFP_per_cells[which(SFP_per_cells$max >= 6),]
+#histogram
+# hist(SFP_per_cells$max)
+#save to data/rthayer/FRT_unmated_nuclei/poster_figs
+
+#subset to genes which are expressed >1 logCPM in >6% of cells in at least 1 cluster--the whole file lists % of cells with logCPM>1. This list will be the denominator for GO, and SFPs found in this list are considered as female-expressed
+per_cells_t$max <- apply(per_cells_t[,c(2:length(per_cells_t))], 1, max)
+full_dataset_exp <- per_cells_t$ClusterID[per_cells_t$max >6]
+length(full_dataset_exp)
+# alternatively, subset to genes expressed in at least one validated, reproductive cluster (non hemocyte, oenocyte, artefact, etc.; yes neurons); these are considered as supported as FRT-expressed by this current dataset in the publication
+per_cells_FRT <- per_cells_t[c(1:30,34)] 
+per_cells_FRT$max <- apply(per_cells_FRT[,c(2:length(per_cells_FRT))], 1, max)
+FRT_exp <- per_cells_FRT$ClusterID[per_cells_FRT$max >6]
+length(FRT_exp)
+summary(sfp_ids %in% FRT_exp)
+FRT_SFP <- sfp_ids[which(sfp_ids %in% FRT_exp)]
+
+# add SFPs that are supported as FRT-expressed by the McDonough-Goldstein and/or Cridland datasets by reading in Supplemental Dataset 6:
+curated <- read.csv('/data/rthayer/FRT_unmated_nuclei/Dataset_S6.txt', sep='\t', header=TRUE)
+exp2<- curated$ID[curated$FRT_expressed =='Y']
+FRT_exp_plus <- unique(c(FRT_SFP,exp2))
+length(FRT_exp_plus)
+
+```
+
+
+# Building the dendrogram / heatmap of sperm and seminal fluid genes
+This needs files procesed by average_per_cluster.py, following from the code chunk just above
+
+Based on the example at https://cran.r-project.org/web/packages/dendextend/vignettes/Cluster_Analysis.html
+
+Prepare data for snseq FRT manuscript Fig. 3 dendrogram / heatmap of clusters expressing SFP, sperm proteome, and secreted genes. 
+
+```{r dendrogram}
+## Prepare data file in the proper format for hierarchical clustering, which shall be columns of clusters by rows of genes; only including the clusters and genes that will be plotted-- 
+#drop the gene name column, drop the non-repro and artefact clusters. Not including neurons for this.
+per_cells_t2<- per_cells_t[2:30]
+
+# using logCPM instead of percent expressing cells
+logcpm_cells <- read.table('/data/rthayer/FRT_unmated_nuclei/logCPM_per_cluster_renamed_colnames.txt', sep='\t', header=TRUE)
+logcpm_cells <- rbind(colnames(logcpm_cells), logcpm_cells)
+logcpm_cells_t <- as.data.frame(t(logcpm_cells))
+colnames(logcpm_cells_t) <- logcpm_cells_t[1,]
+logcpm_cells_t <- logcpm_cells_t[-(1:2),]
+logcpm_cells_t[2:length(logcpm_cells_t)] <- lapply(logcpm_cells_t[2:length(logcpm_cells_t)], as.numeric)
+logcpm_cells_t2 <- logcpm_cells_t[2:30]
+#subset to genes that I want in Fig.3
+#recall that everything in per_cells_t exists in the single cell object (may not formally be called as expressed, in other words it can include things expressed in fewer than 6% of cells per cell type)
+
+#to plot all SFPs, regardless of FRT expression
+#Fig3_geneList_sfpSP_only <- per_cells_t$ClusterID %in% sfp | per_cells_t$ClusterID %in% sperm_assoc_pre$FBgn_id
+
+#Alternatively, to plot only FRT-expressed SFPs
+#Fig3_geneList_sfpSP_only <- per_cells_t$ClusterID %in% FRT_exp_plus | per_cells_t$ClusterID %in% sperm_assoc_pre$FBgn_id
+
+#annotate genes by plottable categories
+tryme <- ifelse(per_cells_t$ClusterID %in% f_uniq_sperm_assoc_pre & per_cells_t$ClusterID %in% FRT_exp_plus, "SFP&FuniqSP", ifelse(per_cells_t$ClusterID %in% f_uniq_sperm_assoc_pre, "FuniqSP", ifelse(per_cells_t$ClusterID %in% FRT_exp_plus & per_cells_t$ClusterID %in% sperm_assoc_pre$FBgn_id, "SFP&SP", ifelse(per_cells_t$ClusterID %in% FRT_exp_plus, "SFP", ifelse(per_cells_t$ClusterID %in% sperm_assoc_pre$FBgn_id, "SP", ifelse(per_cells_t$ClusterID %in% secreted, "other_secreted", "NA"))))))
+
+per_cells_t_categories <- as.factor(tryme)
+
+per_cells_t2$Category <- per_cells_t_categories
+per_cells_keep <- per_cells_t2[which(per_cells_t2$Category != 'NA'),]
+
+#same for logCPM object
+tryme2 <- ifelse(logcpm_cells_t$ClusterID %in% f_uniq_sperm_assoc_pre & logcpm_cells_t$ClusterID %in% FRT_exp_plus, "SFP&FuniqSP", ifelse(logcpm_cells_t$ClusterID %in% f_uniq_sperm_assoc_pre, "FuniqSP", ifelse(logcpm_cells_t$ClusterID %in% FRT_exp_plus & logcpm_cells_t$ClusterID %in% sperm_assoc_pre$FBgn_id, "SFP&SP", ifelse(logcpm_cells_t$ClusterID %in% FRT_exp_plus, "SFP", ifelse(logcpm_cells_t$ClusterID %in% sperm_assoc_pre$FBgn_id, "SP", ifelse(logcpm_cells_t$ClusterID %in% secreted, "other_secreted", "NA"))))))
+
+logcpm_cells_t_categories <- as.factor(tryme2)
+
+logcpm_cells_t2$Category <- logcpm_cells_t_categories
+logcpm_cells_keep <- logcpm_cells_t2[which(logcpm_cells_t2$Category != 'NA'),]
+
+
+#write that object to run the actual plotting on my laptop because the virtual desktop and graphics stuff are very hateful and won't do it. See subsequent code chunk.
+write.csv(per_cells_keep, file='/data/rthayer/FRT_unmated_nuclei/dataset_for_fig3_dendroHeatmap.csv')
+write.csv(logcpm_cells_keep, file='/data/rthayer/FRT_unmated_nuclei/dataset_for_fig3_dendroHeatmap_logcpm.csv')
+
+#find identities of the three highly expressed PSC sperm proteome genes to name them in the main text:
+logcpm_PSC <- logcpm_cells_keep[which(logcpm_cells_keep$Category == 'FuniqSP'),] # the sole SFP&FuniqSP gene isn' high in AGSC
+View(logcpm_PSC) #sort by logcpm in AGSC, read the file
+
+
+```
+
+Continuing with generating the clustered expression heatmap for Fig. 5. This chunk was done separately on laptop, due to problems with virtual desktop and graphics rendering
+```{r all in together now}
+#define a function used later:
+some_col_func <- function(n) rev(colorspace::heat_hcl(n, c = c(80, 30), l = c(30, 90), power = c(1/5, 1.5)))
+
+## subset and separately cluster: SFPs
+per_cells_sfps <- per_cells_keep[which(per_cells_keep$Category=='SFP'), 1:29]
+d_per_sfps <- dist(per_cells_sfps) # method="man" # is a bit better, there are a BUNCH of method options
+hc_per_sfps <- hclust(d_per_sfps, method = "complete")
+dend_sfps <- as.dendrogram(hc_per_sfps)
+#reorder the original subsetted table to match the clustering order
+per_cells_sfps_plottable <- per_cells_sfps2[order.dendrogram(dend_sfps),]
+#check plotting on just this piece:
+gplots::heatmap.2(as.matrix(per_cells_sfps_plottable), dendrogram = 'none', Rowv=FALSE, Colv=FALSE, trace='none', col=some_col_func, main='SFP heatmap') #good!
+
+#now separate and cluster sperm proteome, inclusive of the one gene that's also an SFP
+per_cells_Funq <- per_cells[which(per_cells$Category=='FuniqSP'| per_cells$Category =='SFP&FuniqSP'), 1:35]
+per_cells_Funq2 <- per_cells_Funq[,-1][,-1]
+d_per_Funq <- dist(per_cells_Funq2) # method="man" # is a bit better, there are a BUNCH of method options
+hc_per_Funq <- hclust(d_per_Funq, method = "complete")
+dend_Funq <- as.dendrogram(hc_per_Funq)
+#reorder the original subsetted table to match the clustering order
+per_cells_Funq_plottable <- per_cells_Funq2[order.dendrogram(dend_Funq),]
+#check plotting on just this piece:
+gplots::heatmap.2(as.matrix(per_cells_Funq_plottable), dendrogram = 'none', Rowv=FALSE, Colv=FALSE, trace='none', col=some_col_func, main = 'uniquely female sperm proteome') #good!
+
+# now do the sperm proteome
+per_cells_sp <- per_cells[which(per_cells$Category=='SP'), 1:35]
+per_cells_sp2 <- per_cells_sp[,-1][,-1]
+d_per_sp <- dist(per_cells_sp2) # method="man" # is a bit better, there are a BUNCH of method options
+hc_per_sp <- hclust(d_per_sp, method = "complete")
+dend_sp <- as.dendrogram(hc_per_sp)
+#reorder the original subsetted table to match the clustering order
+per_cells_sp_plottable <- per_cells_sp2[order.dendrogram(dend_sp),]
+#check plotting on just this piece:
+gplots::heatmap.2(as.matrix(per_cells_sp_plottable), dendrogram = 'none', Rowv=FALSE, Colv=FALSE, trace='none', col=some_col_func, main='SP heatmap')
+
+# now the tiny few other things that are both SFP and SP
+per_cells_sfpsp <- per_cells[which(per_cells$Category=='SFP&SP'), 1:35]
+per_cells_sfpsp2 <- per_cells_sfpsp[,-1][,-1]
+d_per_sfpsp <- dist(per_cells_sfpsp2) # method="man" # is a bit better, there are a BUNCH of method options
+hc_per_sfpsp <- hclust(d_per_sfpsp, method = "complete")
+dend_sfpsp <- as.dendrogram(hc_per_sfpsp)
+#reorder the original subsetted table to match the clustering order
+per_cells_sfpsp_plottable <- per_cells_sfpsp2[order.dendrogram(dend_sfpsp),]
+#check plotting on just this piece:
+gplots::heatmap.2(as.matrix(per_cells_sfpsp_plottable), dendrogram = 'none', Rowv=FALSE, Colv=FALSE, trace='none', col=some_col_func, main='SFPandSP heatmap')
+
+#### Now append the subdatasets that are ordered nicely within themselves. Separate by fake rows that will plot totally black across the board, so that later in Illustrator I can see where to draw the category labels (SFP, F uniq SP, etc)
+breaker_row<-rep(100, 33) # first value must match "max" expression value however the expression level values are scaled, second value here must match dim(per_cells_Funq_plottable[2])
+big_plottable <- do.call("rbind", list(per_cells_sfps_plottable, breaker_row, per_cells_sfpsp_plottable, breaker_row, per_cells_sp_plottable, breaker_row, per_cells_Funq_plottable))
+
+# big plot:
+gplots::heatmap.2(as.matrix(big_plottable), dendrogram = 'none', Rowv=FALSE, Colv=FALSE, trace='none', col=some_col_func, main='SFP and SP expression')
+
+```
+
+# Find marker genes
+Toward annotating the clusters. This includes 1) identifying promising marker genes for in situ and 2) compare top 4 marker genes for each cell type to organ-level expression in McDonough-Goldstein transcriptomes. All significant markers go to the supplemental dataset 5 of marker genes in the publication.
+
+```{r markers}
+FRT.markers <- FindAllMarkers(FRT.combined.full, only.pos = TRUE, min.pct = 0.25, logfc.threshold=0.25)
+top4 <- FRT.markers %>%
+  group_by(cluster) %>%
+  slice_max(n=4, order_by = avg_log2FC)
+write.table(top4, file="/data/rthayer/FRT_unmated_nuclei/FRT_merged_markers_wdenovo.txt",sep="\t", col.names=TRUE, quote=FALSE) #used to compare to McDonough-Goldstein
+
+#subset to significant and compelling marker genes to report in Dataset S5
+FRT_reported_markers <- FRT.markers[which(FRT.markers$p_val_adj <.05 & FRT.markers$avg_log2FC >1.5 ),]
+#write to file for Table S5; includes artefact cluster markers, etc.
+write.table(FRT_reported_markers, file="/data/rthayer/FRT_unmated_nuclei/Dataset_S5.txt",sep="\t", col.names=TRUE, quote=FALSE)
+
+#get the number of FRT marker genes to report in main text
+repro_cells <- c('00-OV-1', '01-OV-2', '02-OV-3', '03-SR-prox1', '04-SR-prox2', '05-SR-prox3', '06-SR-dist1', '07-SR-dist2', '08-SSC',   '10-ST-ep', '11-ST-AG-duct', '12-AGSC',   '14-UT-to-ST', '15-UT-PE', '16-UT-to-SR', '17-UT-ant1', '18-UT-ant2', '19-UT-mid1', '20-UT-mid2', '21-UT-mid3', '22-UT-mid4', '23-UT-post', '24-UT-mem', '25-FB', '28-MUS1', '29-MUS2', '30-MUS3', '31-MUS4', '32-MUS5', '36-neuron')
+
+FRT_reported_markers <- FRT.markers[which(FRT.markers$p_val_adj <.05 & FRT.markers$avg_log2FC >1.5 & FRT.markers$cluster %in% repro_cells),]
+length(unique(FRT_reported_markers$gene)) # number of marker genes we've found (broad-sense; non-experimentally validated)
+
+#fishing out markers that are also SFPs; some then targeted with in situ
+fishing<- FRT_reported_markers[which(FRT_reported_markers$gene %in% sfp_ids),]
+
+```
+
+
+# Gene Ontology analysis of the clusters
+Run in bulk on all clusters to explore possible cell-type functions by looking for gene functional enrichments in the cell-level transcriptomes.
+
+There are 6 GO code chunks; 2 per each GO set (Bio Process, Molecular Function, Cell Ccompartment). The first chunk in each pair does the high-throughput GO calls; the second writes the results to files. In the first Bio Process block only, the code also has an optional command that will write out the name of all expressed genes for each cluster.
+
+NOTE on settings: this defines the GO denominator / 'gene universe' as all genes expressed in this dataset at a level >ppk is in neurons, in at least one cluster, somewhere in the dataset. There are ~6600 such genes. To be a 'target gene', the gene must be expressed > 1 in >40 % of cells in the focal cluster. Initially tried >20% of cells; it was too noisy. I only consider GO terms with at least 10 annotated genes (nodeSize setting). It's returning the top 60 best GO hits; these are all reported but can later be filtered by significance, effect size, uniqueness to very few clusters, etc as desired.
+
+(Aggregated results from these sections are read back into R in a later code chunk and used for figure making.)
+```{r GO-BP, message=FALSE, results='hide'}
+#the denominator / 'gene universe' for these tests is 'full_dataset_exp', defined in an earlier chunk
+
+GOproduct <- sapply(levels(FRT.combined), function(cluster){
+  cluster.dat <- subset(FRT.combined, idents = cluster)
+  expr <- as.matrix(GetAssayData(cluster.dat))
+  # Filter out genes that are are not called expressed anywhere in dataset
+  expr <- expr[which(row.names(expr) %in% full_dataset_exp),]
+  # Select genes that are expressed > 1 in at least 40% of cells
+  n.gt.0 <- apply(expr, 1, function(x)length(which(x > 1)))
+  expressed.genes <- row.names(expr)[which(n.gt.0/ncol(expr) >= 0.4)]
+  all.genes <- rownames(expr)
+  #optionally, write a file of genes names that are expressed in the cluster
+  #write(expressed.genes, file=str_glue('/data/rthayer/FRT_unmated_nuclei/expressed.genes.{cluster}.txt'))
+  # define geneList as 1 if gene is in expressed.genes, 0 otherwise
+  geneList <- ifelse(all.genes %in% expressed.genes, 1, 0)
+  names(geneList) <- all.genes
+  # Create topGOdata object
+  GOdata <- new("topGOdata",
+                ontology = "BP",
+                allGenes = geneList,
+                geneSelectionFun = function(x)(x == 1),
+                nodeSize = 10,
+                annot = annFUN.org, mapping = "org.Dm.eg.db", ID = "ENSEMBL")
+  # Test for enrichment using Fisher's Exact Test
+  resultFisher <- runTest(GOdata, algorithm = "elim", statistic = "fisher")
+  print(GenTable(GOdata, Fisher = resultFisher, topNodes = 60, numChar = 60))
+})
+```
+
+Put the GO results into a useful and intelligible data structure, write it out per cluster. This will write the same number of files as we have clusters. Afterward in terminal can use this line to concatenate the per-cluster results together:
+tail -n +1 file1.txt file2.txt (etc) > GO_BP_perclus.txt
+or more simply
+tail -n +1 *cluster.txt > GO_BP_perclus.txt
+
+Also some example code for looking through the results for cluster 28 as an example.
+
+Update the hard-coded save path to match your directory. As written, the directory 'BP' must already exist for code chunk to work.
+```{r GO interpret-BP, message=FALSE}
+cluster_IDs <- levels(FRT.combined)
+
+lapply(cluster_IDs, function(i){
+  print(i)
+  minidf<- as.data.frame(GOproduct[,i])
+  write.table(minidf, file=paste("/data/rthayer/FRT_unmated_nuclei/GO_results_cluster/BP/",i, ".cluster.txt",sep=""), sep="\t", col.names=TRUE)
+})
+
+#print(as.data.frame(GOproduct[,28])) #to look at results for cluster #28 directly in R
+
+```
+
+Now run GO again for Molecular Function terms
+```{r GO-MF, message=FALSE, results='hide'}
+GOproduct.MF <- sapply(levels(FRT.combined), function(cluster){
+  cluster.dat <- subset(FRT.combined, idents = cluster)
+  expr <- as.matrix(GetAssayData(cluster.dat))
+  # Filter out genes that are are not called expressed anywhere in dataset
+  expr <- expr[which(row.names(expr) %in% full_dataset_exp),]
+  # Select genes that are expressed > 1 in at least 40% of cells
+  n.gt.0 <- apply(expr, 1, function(x)length(which(x > 1)))
+  expressed.genes <- row.names(expr)[which(n.gt.0/ncol(expr) >= 0.4)]
+  all.genes <- rownames(expr)
+  # define geneList as 1 if gene is in expressed.genes, 0 otherwise
+  geneList <- ifelse(all.genes %in% expressed.genes, 1, 0)
+  names(geneList) <- all.genes
+  # Create topGOdata object
+  GOdata <- new("topGOdata",
+                ontology = "MF",
+                allGenes = geneList,
+                geneSelectionFun = function(x)(x == 1),
+                nodeSize = 10,
+                annot = annFUN.org, mapping = "org.Dm.eg.db", ID = "ENSEMBL")
+  # Test for enrichment using Fisher's Exact Test
+  resultFisher <- runTest(GOdata, algorithm = "elim", statistic = "fisher")
+  print(GenTable(GOdata, Fisher = resultFisher, topNodes = 60, numChar = 60))
+})
+```
+Save results for MF
+```{r GO interpret-MF, message=FALSE}
+cluster_IDs <- levels(FRT.combined)
+
+lapply(cluster_IDs, function(i){
+  print(i)
+  minidf<- as.data.frame(GOproduct.MF[,i])
+  write.table(minidf, file=paste("/data/rthayer/FRT_unmated_nuclei/GO_results_cluster/MF/",i, ".cluster.txt",sep=""), sep="\t", col.names=TRUE)
+})
+
+```
+
+Run again for Cellular Compartment GO terms
+```{r GO-CC, message=FALSE, results='hide'}
+GOproduct.CC <- sapply(levels(FRT.combined), function(cluster){
+  cluster.dat <- subset(FRT.combined, idents = cluster)
+  expr <- as.matrix(GetAssayData(cluster.dat))
+  # Filter out genes that are are not called expressed anywhere in dataset
+  expr <- expr[which(row.names(expr) %in% full_dataset_exp),]
+  # Select genes that are expressed > 1 in at least 40% of cells
+  n.gt.0 <- apply(expr, 1, function(x)length(which(x > 1)))
+  expressed.genes <- row.names(expr)[which(n.gt.0/ncol(expr) >= 0.4)]
+  all.genes <- rownames(expr)
+  # define geneList as 1 if gene is in expressed.genes, 0 otherwise
+  geneList <- ifelse(all.genes %in% expressed.genes, 1, 0)
+  names(geneList) <- all.genes
+  # Create topGOdata object
+  GOdata <- new("topGOdata",
+                ontology = "CC",
+                allGenes = geneList,
+                geneSelectionFun = function(x)(x == 1),
+                nodeSize = 10,
+                annot = annFUN.org, mapping = "org.Dm.eg.db", ID = "ENSEMBL")
+  # Test for enrichment using Fisher's Exact Test
+  resultFisher <- runTest(GOdata, algorithm = "elim", statistic = "fisher")
+  print(GenTable(GOdata, Fisher = resultFisher, topNodes = 60, numChar = 60))
+})
+```
+
+Save CC results. Won't work if the directories don't already exist
+
+```{r GO interpret-CC, message=FALSE}
+cluster_IDs <- levels(FRT.combined)
+
+lapply(cluster_IDs, function(i){
+  print(i)
+  minidf<- as.data.frame(GOproduct.CC[,i])
+  write.table(minidf, file=paste("/data/rthayer/FRT_unmated_nuclei/GO_results_cluster/CC/",i, ".cluster.txt",sep=""), sep="\t", col.names=TRUE)
+})
+
+```
+
+After evaluating the GO results, can look up the identities of genes inside interesting enrichments as so:
+```{r whats in GO}
+all.genes.in.term <- genesInTerm(GOdata)[["GO:0030139"]]
+expressed.genes.in.term <- intersect(all.genes.in.term, expressed.genes)
+```
+
+code for doing GO analysis on only 1 specified cluster. Can be useful to troubleshoot the pipeline. Can also use to rerun a particular cluster of interest and grab the identities of genes that make up the enrichment
+```{r GO, warning=FALSE,error=FALSE,message=FALSE, eval=FALSE}
+cluster28 <- subset(FRT.combined, idents = '12-AGSC')
+expr <- as.matrix(GetAssayData(cluster28))
+# Filter out genes that are 0 for every cell in this cluster
+#bad <- which(rowSums(expr) == 0)
+#expr <- expr[-bad,]
+expr <- expr[which(row.names(expr) %in% full_dataset_exp),]
+
+# Select genes that are expressed > 0 in at least half of cells
+n.gt.0 <- apply(expr, 1, function(x)length(which(x > 1)))
+expressed.genes <- rownames(expr)[which(n.gt.0/ncol(expr) >= 0.1)] #you can choose a higher cutoff if you like
+all.genes <- rownames(expr)
+
+# define geneList as 1 if gene is in expressed.genes, 0 otherwise
+geneList <- ifelse(all.genes %in% expressed.genes, 1, 0)
+names(geneList) <- all.genes
+
+# Create topGOdata object
+#geneSelectionFun = function(x)(x == 1),
+GOdata <- new("topGOdata",
+		ontology = "CC",
+		allGenes = geneList,
+		#geneSel = geneList[which(geneList)],
+		geneSelectionFun = function(x)(x == 1),
+		nodeSize=10,
+              annot = annFUN.org, 
+		mapping = "org.Dm.eg.db", ID ="ENSEMBL")
+	
+	#if (!any(rownames(installed.packages()) == "org.Hs.eg.db")){BiocManager::install("org.Dm.eg.db")}
+	
+	
+# Test for (significant) enrichment using Fisher's Exact Test
+	resultFisher <- runTest(GOdata, algorithm = "elim", statistic = "fisher")
+	GenTable(GOdata, Fisher = resultFisher, topNodes = 20, numChar = 60)
+
+#this gets identities of the genes that make up the enrichment call. Example for 'polytene chromosome' in AGSC		
+all.genes.in.term <- genesInTerm(GOdata)[["GO:0005700"]]
+expressed.genes.in.term <- intersect(all.genes.in.term, expressed.genes)
+expressed.genes.in.term
+```
+
+## Evolutionary analyses
+
+First: ask whether sex-shared SFPs have a different evolutionary rate than male-limited ones; compare to other melanogaster secreted genes in the process.
+
+Regrettably we have to deal with 3 different genome annotation versions among these files-- oldest in the dN/dS data from Fly Divas (version corresponding to FlyBase 2015_2); next oldest in Fraisse et al's alpha table (v5). Transferring all gene IDs to a matching genome version was done with FBgn_version_lookup.py on the raw tables, prior to reading in the files. To replicate the analysis, you can skip th version control stuff and just read in and use the supplemental dataset 7.
+
+```{r evo by SFP category}
+# get data
+#MKA_pre <- read.csv('/data/julie/MK_Fraisse_recalculated.txt', sep='\t')
+MKA_pre <- read.csv('/data/rthayer/references/MK_Fraisse_recalculated_fixed.txt', sep=',')
+# Note the Fraisse file geneID nomenclatures are based on genome version 5; has lots of alt FBgn IDs and they don't parse together well
+
+# this is a longest CDS file version Julie Cridland kindly made with v5 genome FBgn's matching the Fraisse et al file, because we considered filtering genes after normalizing SNPs per kb (ended up not doing that anyway). There are now only ~40 entries in Fraisse table without CDS length, which she spot checked and found to be psuedogenes or annotation withdrawn from v6 genome.
+CDS <- read.csv('/data/julie/Fraisse_longest_CDS', col.names=c('geneId','FTbr','CDS_length','pos'), sep='\t')
+MKA <- merge(MKA_pre, CDS, by='geneId', all.x=TRUE)
+MKA$X <- NULL
+
+#convert geneIDs to current annotation version
+#library(readr)
+#synon_ID_key <- read_tsv('/data/FlyRef/current/precomputed_files/genes/fbgn_annotation_ID_fb_2021_04.tsv.gz', skip=3)
+
+#get dn/dS values from another source
+#many genes including like half the SFPs are missing in one or other list; needs version control
+divas <- read.table('/data/rthayer/references/Dmel_Dsim_analysis_results_flydivas_v1.2_fixed', sep=',', header=TRUE)
+#convert geneIDs to current version
+#colnames(divas)[4] <- 'geneId'
+colnames(divas)[10] <- 'DnDs'
+divas$X <- NULL
+
+MK_full <- merge(MKA, divas, by='geneId_fixed', all.x=TRUE, all.y=TRUE)
+
+#before intersecting with other gene lists, e.g. SFP, FRT-exp list, should update FBgns in the Fraisse table to the latest genome version. This would use a dataset downloaded from FlyBase:
+#'/data/FlyRef/current/precomputed_files/genes/fbgn_annotation_ID_fb_2021_04.tsv.gz'
+#
+#
+#
+## Now actually using the version-controlled data:
+# compare evolutionary metrics among SFP categories
+# first, make a list of all FRT-expressed genes from this dataset plus SFPs we've considered expressed per other datasets
+FRT_exp_full <- unique(c(FRT_exp,exp2))
+
+# Add columns to the Fraisse table with each gene's designation as secreted, SFP, etc.
+
+secreted_pre <- read.csv("/data/rthayer/references/secreted_genes.csv", header=FALSE, col.names="V1") #list of secreted genes, from supplemental dataset
+
+MK_full$secreted <- MK_full$geneId_fixed %in% secreted_pre$V1
+MK_full$SFP <- MK_full$geneId_fixed %in% SFP_genes
+MK_full$FRT_exp <- MK_full$geneId_fixed %in% FRT_exp_full
+MK_full$sex_shared <- MK_full$SFP == TRUE & MK_full$FRT_exp==TRUE
+MK_full$male_lim_SFP <- MK_full$SFP == TRUE & MK_full$FRT_exp==FALSE
+
+tryme <- ifelse(MK_full$male_lim_SFP, "0M_lim_SFP", ifelse(MK_full$sex_shared, "1sex_shared_SFP", ifelse(MK_full$secreted & MK_full$FRT_exp, "2FRT_secreted-nonSFP", ifelse(MK_full$secreted & MK_full$FRT_exp==FALSE & MK_full$SFP==FALSE, "3other_secreted", "4other_genes"))))
+
+MK_full$category <- as.factor(tryme)
+#get gene counts per category for the table:
+summary(MK_full$category)
+
+# plot the thing
+boxplot(MK_full$alphaMK ~ MK_full$category)
+abline(h=0)
+boxplot(MK_full$DnDs ~ MK_full$category, ylim=c(0,4))
+abline(h=1)
+
+# find the proportion which are putatively positively selected per category
+# as a proportion: DNDS
+#selecting for DnDs >=0 is to drop NAs
+take_proportion <- function(x){
+  temp<- MK_full$DnDs[which(MK_full$category==x & MK_full$DnDs>=0)]
+  list(x, sum(temp>1)/length(temp))}
+
+SFP_evo_by_cat <-as.data.frame(t(sapply(levels(MK_full$category), take_proportion)), stringsAsFactors=TRUE)
+SFP_evo_by_cat
+#plot the proportions as a barplot, optional
+SFP_evo_by_cat$V2 <- as.numeric(SFP_evo_by_cat$V2)
+barplot(SFP_evo_by_cat$V2, names=SFP_evo_by_cat$V1, las=2)
+
+# significance test on proportions for DNDS
+#test of heterogeneity on the proportion
+#Ho: proportion of DnDS >1 is the same across all gene categories
+#H1: proportion of positively selected marker genes is different in at least one category
+#Data prep
+take_counts <- function(x){
+  temp<- MK_full$DnDs[which(MK_full$category==x & MK_full$DnDs>0)]
+  list(x, sum(temp>1), length(temp))
+}
+counts_pos_dnds      <-as.data.frame(t(sapply(levels(MK_full$category), take_counts)), stringsAsFactors=TRUE)
+colnames(counts_pos_dnds) <- c("category","pos_selected","num_genes")
+counts_pos_dnds$pos_selected <- as.numeric(counts_pos_dnds$pos_selected)
+#counts_pos_dnds$category <- as.factor(counts_pos_dnds$category)
+counts_pos_dnds$not_selected <- as.numeric(counts_pos_dnds$num_genes) - as.numeric(counts_pos_dnds$pos_selected)
+xtab <- as.table(rbind(as.numeric(counts_pos_dnds$pos_selected), counts_pos_dnds$not_selected))
+dimnames(xtab)<-list(
+  pos_selected = c("Yes","No"),
+  Categories = counts_pos_dnds$category
+)
+#significance test it
+fisher.test(xtab)
+#fisher.multcomp(xtab) 
+library(rstatix)
+pairwise_fisher_test(xtab, p.adjust.method="hochberg")
+
+# sig test difference in mean dNdS among categories
+res<-kruskal.test(MK_full$DnDs ~ MK_full$category)
+#posthoc pairwise
+PT = dunn_test(data= MK_full, formula=DnDs~category, p.adjust.method='hochberg')
+#pull median dN/dS value per category
+take_median <- function(x){
+  temp<- MK_full$DnDs[which(MK_full$category==x & MK_full$DnDs>0)]
+  list(x, median(temp))
+}
+counts_pos_dnds      <-as.data.frame(t(sapply(levels(MK_full$category), take_median)), stringsAsFactors=TRUE)
+
+# Now proportions of MKalpha>0
+#NOTE decided not to use additional filters on gene length; minimum number of observed SNPs per category, etc because we are testing broad category differences, rather than assessing individual genes as +/- selected.
+take_proportion <- function(x){
+  temp<- MK_full$alphaMK[which(MK_full$category==x & MK_full$alphaMK <= 1)]
+  list(x, sum(temp>0)/length(temp))}
+
+SFP_evo_by_cat_mka <-as.data.frame(t(sapply(levels(MK_full$category), take_proportion)), stringsAsFactors=TRUE)
+
+SFP_evo_by_cat_mka
+barplot(as.numeric(SFP_evo_by_cat_mka$V2), names=SFP_evo_by_cat_mka$V1, las=2)
+
+# significance test on proportions: MKalpha filtered
+# significance test on proportions for positive MKA
+#test of heterogeneity on the proportion
+#Ho: proportion of alpha >0 is the same across all categories
+#H1: proportion of positively selected genes is different in at least one category
+#Data prep
+take_counts <- function(x){
+  temp<- MK_full$alphaMK[which(MK_full$category==x & MK_full$alphaMK <= 1)]
+  list(x, sum(temp>0), length(temp))
+}
+counts_pos_mka      <-as.data.frame(t(sapply(levels(MK_full$category), take_counts)), stringsAsFactors=TRUE)
+colnames(counts_pos_mka) <- c("category","pos_selected","num_genes")
+counts_pos_mka$pos_selected <- as.numeric(counts_pos_mka$pos_selected)
+counts_pos_mka$not_selected <- as.numeric(counts_pos_mka$num_genes) - as.numeric(counts_pos_mka$pos_selected)
+xtab <- as.table(rbind(as.numeric(counts_pos_mka$pos_selected), counts_pos_mka$not_selected))
+dimnames(xtab)<-list(
+  pos_selected = c("Yes","No"),
+  Categories = counts_pos_mka$category
+)
+#significance test it
+fisher.test(xtab)
+pairwise_fisher_test(xtab, p.adjust.method="hochberg")
+
+# distribution of values among the putatively positively selected set
+boxplot(MK_full$DnDs[which(MK_full$DnDs >1)] ~ MK_full$category[which(MK_full$DnDs>1)], ylim=c(0,5))
+boxplot(MK_full$alphaMK[which(MK_full$alphaMK >0)] ~ MK_full$category[which(MK_full$alphaMK>0)])
+
+## write a cleaned-up version of it for Supplemental Dataset 7
+MK_full_to_write <- MK_full[,c('geneId_fixed','geneName','alphaMK','CDS_length','DnDs','secreted','SFP','FRT_exp','sex_shared','male_lim_SFP','category')]
+colnames(MK_full_to_write)[1]<- "geneID"
+write.table(MK_full_to_write, file='/data/rthayer/FRT_unmated_nuclei/DatasetS7.txt',sep="\t", col.names=TRUE, quote=FALSE)
+
+```
+
+Testing whether evo metrics differ among cell types
+and finding FRT-specific fast-evolving outlier genes
+
+```{r}
+#subset to genes that are expressed
+FRT_exp_hi <- per_cells_t[which(per_cells_t$max >6),]
+colnames(FRT_exp_hi)[1]<-'geneId_fixed'
+#identify the max-expressing cluster for each gene
+max_cluster_pos <- apply(FRT_exp_hi[,c(2:length(FRT_exp_hi))], 1, which.max)+1 # +1 is because everything actually starts from mean_counts_t column #2
+max_cluster <- colnames(FRT_exp_hi)[max_cluster_pos]
+# put it into our object
+FRT_exp_hi <- cbind(FRT_exp_hi, max_cluster)
+#make it have levels for plotting purposes
+levels(FRT_exp_hi$max_cluster)<- sort(unique(FRT_exp_hi$max_cluster))
+
+#merge that table with the evo data
+marker_genes_evo <- merge(MK_full, FRT_exp_hi, by='geneId_fixed') #5200 genes left
+#look at dN/dS acorss clusters
+give.n <- function(x){
+  return(c(y=mean(x), label=length(x)))
+  }
+ggplot(marker_genes_evo, aes(y=DnDs, x=max_cluster))+geom_boxplot()+theme(axis.text.x = element_text(angle=90,vjust=0.5, hjust=1))+ stat_summary(fun.data=give.n, geom="text")
+
+#proportion of markers with positive mkalpha value
+take_proportion <- function(x){
+  temp<- marker_genes_evo$alphaMK[which(marker_genes_evo$max_cluster==x)]
+  list(x, sum(temp>0)/length(temp))
+}
+
+marker_genes_evo$max_cluster <- as.factor(marker_genes_evo$max_cluster)
+markers_mka <-as.data.frame(t(sapply(levels(marker_genes_evo$max_cluster), take_proportion)), stringsAsFactors=TRUE)
+markers_mka$V2 <- as.numeric(markers_mka$V2)
+markers_mka$cluster <- factor(markers_mka$V1, levels=levels(marker_genes_evo$max_cluster))
+
+ggplot(markers_mka, aes(V2, cluster))+geom_bar(stat="identity")+xlab("proportion of marker genes w MKalpha>0")
+
+#test of heterogeneity on the proportion
+#Ho: proportion of MKA >0 is the same across all cell types
+#H1: proportion of positively selected marker genes is different in at least one cell type
+#Data prep
+take_counts <- function(x){
+  temp<- marker_genes_evo$alphaMK[which(marker_genes_evo$max_cluster==x)]
+  list(x, sum(temp>0), length(temp))
+}
+markers_mka_n      <-as.data.frame(t(sapply(levels(marker_genes_evo$max_cluster), take_counts)), stringsAsFactors=TRUE)
+colnames(markers_mka_n) <- c("c","pos_selected","no_markers")
+markers_mka_n$V2 <- as.numeric(markers_mka$V2)
+markers_mka_n$cluster <- factor(markers_mka$V1, levels=levels(marker_genes_evo$max_cluster))
+markers_mka_n$no_selected <- as.numeric(markers_mka_n$no_markers) - as.numeric(markers_mka_n$pos_selected)
+#drop clusters with too small sample size:
+markers_mka_n <- markers_mka_n[which(markers_mka_n$no_markers > 10),]
+xtab <- as.table(rbind(as.numeric(markers_mka_n$pos_selected), markers_mka_n$no_selected))
+dimnames(xtab)<-list(
+  pos_selected = c("Yes","No"),
+  Clusters = markers_mka_n$cluster
+)
+
+xtab_fit <-prop_test(xtab, detailed=TRUE)
+summary(xtab_fit)
+pw_xtab <- pairwise_prop_test(xtab)
+View(pw_xtab) #sort it by the significance column. Nothing interesting is significant; mostly it's all artefact 2
+
+fit1 <-kruskal.test(marker_genes_evo$DnDs ~ marker_genes_evo$max_cluster)
+PT = dunn_test(data= marker_genes_evo, formula=DnDs~max_cluster, p.adjust.method='hochberg')
+PT
+
+######################
+# finding outlier rapid evo genes that are specific to FRT to mention in main text
+# this uses a pre-computed data file from Julie Cridland that gives the tau index of tissue specificity for each gene in the FlyAtlas2 Adult Female tissue set. See description and citation in Methods in the Thayer 2024 publication. The FlyAtlas2 data does not include most of the FRT but does include the spermatheca.
+tau_f <- read.csv("/data/julie/AG_Denovo/Female_FlyAtlas2_tau", sep='\t')
+
+#subset it down to those genes that are FRT.expressed in my single cell data 
+tau_f_sec <- tau_f[which(tau_f$Gene %in% FRT_exp),]
+
+#subset down to those with high female taus in FlyAtlas2, ~1050 remaining, or ~350 secreted remaining
+hi_tau_f <- tau_f_sec[which(tau_f_sec$Tau > 0.89),]
+
+#subset to those of the tissue-specific genes whose max tissue = ST. Of course, I'd also be interested in those genes whose expression is highly specific to other parts of the FRT, like the UT, ST, AG... can't learn that from FlyAtlas, but as a sort of proxy, will include genes whose max expression is in FemaleCarcass; implying the gene must be expressed pretty highly in a tissue that wasn't individually targeted by FlyAtlas2.
+hi_tau_ST <- hi_tau_f[which(hi_tau_f$Tissue =='Female_Mated_Spermatheca' | hi_tau_f$Tissue =='Female_Virgin_Spermatheca' | hi_tau_f$Tissue =='FemaleCarcass'),] #77 genes left
+plot(hi_tau_ST$Tau, hi_tau_ST$Max)
+
+# Remove genes that are expressed in adult male
+tau_m <- read.csv("/data/julie/AG_Denovo/Male_FlyAtlas2_tau", sep='\t')
+not_in_m <- tau_m[which(tau_m$Max < 2),] #no TPM > 2 allowed anywhere in adult male
+perfect <- hi_tau_ST[which(hi_tau_ST$Gene %in% not_in_m$Gene),]
+#31 genes remaining
+#make sure they're not SFPs... resulting object is all 'NA'
+checker <- perfect$Gene[SFP_genes]
+
+## now we merge with the evolutionary estimators file, to find FRT-specific genes that are evolving faster
+perfect_evo <-MK_full[which(MK_full$geneId_fixed %in% perfect$Gene),]
+perfect3 <-merge(perfect_evo[which(perfect_evo$alphaMK >0.3),], perfect, by.x='geneId_fixed', by.y='Gene')
+
+#explore the 'perfect' ones bit more
+plot(perfect$Tau, perfect$Max)
+#hand check; these ones with low exp are dropped
+VlnPlot(FRT.combined, feature="FBgn0037224")
+VlnPlot(FRT.combined, feature="FBgn0040279")
+#low max in the tau table but good:
+VlnPlot(FRT.combined, feature="FBgn0031887")
+perfect <- perfect[which(perfect$Gene != 'FBgn0037224' & perfect$Gene != 'FBgn0040279'),]
+```
+
+
+## Annotating clusters from FlyCell Atlas comparisons
+using marker genes from prior literature and FlyCell Atlas to annotate cell types where possible
+```{r hemocytes etc}
+#hemocytes c18
+#Nimc1 and Nimc4 to ID hemocytes, and He,Hml to subset hemocytes. See Tattikota 2020 eLife and Hopkins et al 
+FeaturePlot(FRT.combined, feature="FBgn0003137") #Ppn
+FeaturePlot(FRT.combined, feature="FBgn0029167") #Hml
+FeaturePlot(FRT.combined, feature="FBgn0259896") #Nimc1, less good
+# oenocytes c36
+VlnPlot(FRT.combined, feature="FBgn0066101")
+VlnPlot(FRT.combined, feature="FBgn0042627")
+VlnPlot(FRT.combined, feature="FBgn0287184")
+VlnPlot(FRT.combined, feature="FBgn0023441")
+# sensory neuron
+VlnPlot(FRT.combined, feature="FBgn0285944") #para
+VlnPlot(FRT.combined, feature="FBgn0004244") #Rdl
+VlnPlot(FRT.combined, feature="FBgn0000024") #Ace
+VlnPlot(FRT.combined, feature="FBgn0259108") #futsch
+VlnPlot(FRT.combined, feature="FBgn0026197") #lncRNA:noe
+# do these neurons have SPR neuron markers?
+VlnPlot(FRT.combined, feature="FBgn0004652") #fru
+VlnPlot(FRT.combined, feature="FBgn0000504") #dsx
+VlnPlot(FRT.combined, feature="FBgn0029768") #SPR
+VlnPlot(FRT.combined, feature="FBgn0020258") #ppk (low)
+
+# muscle 8,14,16,25
+#also honorable mentions by 18, 24 which are the SR
+VlnPlot(FRT.combined, feature="FBgn0005666") #bt
+VlnPlot(FRT.combined, feature="FBgn0086906") #sls
+VlnPlot(FRT.combined, feature="FBgn0004169") #up
+#annotating ST secretory vs epithelial following Shen, Sun 2017 (antibody)
+#secretory cells--confirms
+VlnPlot(FRT.combined, feature="FBgn0003053") #Hnt aka pebbled
+VlnPlot(FRT.combined, feature='FBgn0003507') #serpent, Sun said is both secretory cell types, it's also fat and hemocytes
+VlnPlot(FRT.combined, feature='FBgn0003117') #pannier, Sun says marks ST sc cells, but it's also in both + hemocytes
+#epithelial cells in the ST gland
+VlnPlot(FRT.combined, feature="FBgn0002576") #Lz lozenge
+# coracle, which mayhew/merritt use as label of septate junction in immature ST. 
+VlnPlot(FRT.combined, feature='FBgn0010434')
+#Nuclear hormone receptor that was targeted by Sun, Spradling 2013 to inhibit ST function. In ST + PV secretory
+VlnPlot(FRT.combined, feature='FBgn0261239') #Hr39
+
+#cluster 33, something tracheal though no exact FlyCell Atlas match
+#its top 4 markers all stain a subset of adult tracheal cell and a subset of unannotated within the tracheal dissection > 10x>stringent.
+VlnPlot(FRT.combined, feature="FBgn0039620")+ggtitle("tracheal cell")
+#wgn is on in FlyCell the unannotated possibly cluster match, but not in the tracheal unannotated cluster match. Off in my data, consistent with mine being tracheal. Same with pk, gol, not shown
+VlnPlot(FRT.combined, feature="FBgn0030941")+ggtitle("unannotated and other tracheal cell")
+#but sick is on in both potential matches in Fly Cell and not in my c33. dar1 is on in the possibly matching Flycell tracheal subset and not in my c33
+
+```
+
+
+Plotting the GO results for Fig. 4 in the manuscript.
+
+You can use Dataset S8, or, to fully reproduce data preparation, see append_GO.py which adds cluster ID as a column to the GO results produced per cluster earlier in this R document. Additionally, to combine GO reports from all 3 areas, run awk 'FNR>1' BP/FRT_clusters.csv MF/FRT_clusters.csv CC/FRT_clusters.csv > FRT_clusters_cat.csv from inside /data/rthayer/FRT_unmated_nuclei/GO_results_cluster and
+echo $(head -n 1 BP/FRT_clusters.csv) > header.csv 
+and
+cat header.csv FRT_clusters_cat.csv > FRT_clusters_cat_header.csv
+
+```{r GO dot plot}
+all_GO <- read.csv('/data/rthayer/FRT_unmated_nuclei/GO_results_cluster/FRT_clusters_cat_header.csv') 
+
+#as introduced, the p values are in scientific notation == characters. Convert them to numeric. Values that say >1e-30 get coerced to NA, so then fix them
+all_GO$Fisher_num <-as.numeric(all_GO$Fisher)
+library(tidyr)
+library(dplyr)
+all_GO$Fisher_num <-replace_na(all_GO$Fisher_num, 0)
+
+# now adjust for multiple hypothesis testing and prune the list:
+all_GO$p_adjust <- p.adjust(all_GO$Fisher_num, method="BH", n=length(all_GO$Fisher_num))
+sig_GO <- all_GO[which(all_GO$p_adjust < .05),] #most are still significant, ~3300 of 4500 hits
+
+#from there, I manually looked through the terms remaining, picked ones that interest me, and grouped them into manageable sets to plot.
+#look at all unique terms remaining after filter on significance (can filter more stringently than .05, as everything in still passes that)
+
+signalling_set <- sig_GO[which(sig_GO$Term %in% c("insulin receptor signaling pathway","negative regulation of epidermal growth factor receptor sign...","negative regulation of signal transduction","positive regulation of canonical Wnt signaling pathway","positive regulation of hippo signaling","positive regulation of smoothened signaling pathway","regulation of Rho protein signal transduction", "endocytic vesicle", "regulation of endocytosis", "positive regulation of receptor-mediated endocytosis")),]
+
+ggplot(data=signalling_set, aes(x=Cluster, y= Term, color=p_adjust,size=Gene_Ratio))+
+  geom_point()+
+  scale_color_gradient(low="red", high="blue")+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))+
+  ylab("")+
+  xlab("")+
+  ggtitle("GO enrichment: signalling")
+#save image at 5inch x 9 inch
+
+juv_horm_set <- c("FBgn0028841","FBgn0034405","FBgn0002723", "FBgn0261703") # "FBgn0010611","FBgn0010053","FBgn0034406",
+Met_interacters <- c("FBgn0266450","FBgn0001233","FBgn0035499","FBgn0014018","FBgn0039209","FBgn0004907","FBgn0023076")#"FBgn0013269","FBgn0010741","FBgn0000492","FBgn0001206","FBgn0262743","FBgn0001078",
+e20_set <- c("FBgn0000546","FBgn0003964","FBgn0041092","FBgn0015239")#"FBgn0020445",
+other_signaling <- c("FBgn0283499","FBgn0011300","FBgn0025800", "FBgn0001085")#"FBgn0000536",InR and activin receptor / pathway, eas = lipid signaling, frizzled
+DotPlot(FRT.combined, features=c(juv_horm_set, Met_interacters, e20_set, other_signaling))+RotatedAxis()&coord_flip()
+
+polyploidy_set <- sig_GO[which(sig_GO$Term %in% c("cellularization","gland development","positive regulation of cell population proliferation","positive regulation of gene expression","positive regulation of organ growth","positive regulation of transcription by RNA polymerase II","positive regulation of transcription elongation from RNA pol...","regulation of autophagy","regulation of cell cycle","regulation of cell growth","regulation of organ growth","salivary gland cell autophagic cell death","salivary gland morphogenesis","gland development")),]
+
+ggplot(data=polyploidy_set, aes(x=Cluster, y= Term, color=p_adjust,size=Gene_Ratio))+
+  geom_point()+
+  scale_color_gradient(low="red", high="blue")+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))+
+  ylab("")+
+  xlab("")+
+  ggtitle("GO enrichment: Bio Process: polyploidy")
+
+```
+
+
+## Save the analyzed data object
+```{r save_rdata, eval=FALSE}
+save(FRT.combined.full, file="/data/rthayer/FRT_unmated_nuclei/interactable_Seurat_full.RData")
+```
+
+## Session Information
+```{r sessioninfo}
+sessionInfo()
+```
