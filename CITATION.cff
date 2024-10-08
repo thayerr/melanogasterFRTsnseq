@@ -1,0 +1,15 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: melanogasterFRTseq
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Rachel
+    family-names: Thayer
+    orcid: 'https://orcid.org/0000-0001-5856-7614'
+    affiliation: University of California Davis
+repository-code: 'https://github.com/thayerr/melanogasterFRTsnseq'
